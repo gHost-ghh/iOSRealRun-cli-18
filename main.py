@@ -38,7 +38,7 @@ async def main():
         logger.setLevel(logging.DEBUG)
         coloredlogs.install(level=logging.DEBUG)
 
-    init.init()
+    await init.init()
     logger.info("init done")
 
     logger.info("trying to start tunnel")

@@ -11,9 +11,21 @@ import asyncio
 
 from geopy.distance import geodesic
 
+import inspect
+from contextlib import asynccontextmanager, suppress
+
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.services.dvt.instruments.location_simulation import LocationSimulation
-from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
+
+try:
+    from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
+except ImportError:
+    DvtProvider = None
+
+try:
+    from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
+except ImportError:
+    DvtSecureSocketProxyService = None
 
 def bd09Towgs84(position):
     wgs_p = {}
@@ -137,27 +149,76 @@ def fixLockT(loc: list, v, dt):
             t += dt
     return fixedLoc
 
-def run1(dvt, loc: list, v, dt=0.2):
+async def maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+@asynccontextmanager
+async def open_dvt(service_provider):
+    """
+    兼容新版 pymobiledevice3 的 DvtProvider。
+    如果旧版还存在 DvtSecureSocketProxyService，也尽量兼容。
+    """
+    if DvtProvider is not None:
+        async with DvtProvider(service_provider) as dvt:
+            yield dvt
+        return
+
+    if DvtSecureSocketProxyService is None:
+        raise RuntimeError(
+            "当前 pymobiledevice3 既没有 DvtProvider，也没有 DvtSecureSocketProxyService，"
+            "DVT 接口无法初始化"
+        )
+
+    dvt = DvtSecureSocketProxyService(service_provider)
+    dvt.perform_handshake()
+    try:
+        yield dvt
+    finally:
+        close = getattr(dvt, "close", None)
+        if close is not None:
+            await maybe_await(close())
+
+
+@asynccontextmanager
+async def open_location_simulation(dvt):
+    location_simulation = LocationSimulation(dvt)
+
+    if hasattr(location_simulation, "__aenter__"):
+        async with location_simulation as service:
+            yield service
+    else:
+        yield location_simulation
+
+async def run1(location_simulation, loc: list, v, dt=0.2):
     fixedLoc = fixLockT(loc, v, dt)
     nList = (5, 6, 7, 8, 9)
     n = nList[random.randint(0, len(nList)-1)]
     fixedLoc = randLoc(fixedLoc, n=n)  # a path will be divided into n parts for random route
     clock = time.time()
     for i in fixedLoc:
-        LocationSimulation(dvt).set(*bd09Towgs84(i).values())
-        while time.time()-clock < dt:
-            pass
+        pos = bd09Towgs84(i)
+        await maybe_await(location_simulation.set(pos["lat"], pos["lng"]))
+
+        sleep_time = dt - (time.time() - clock)
+        if sleep_time > 0:
+            await asyncio.sleep(sleep_time)
+
         clock = time.time()
 
 async def run(address, port, loc: list, v, d=15):
     random.seed(time.time())
-    rsd = RemoteServiceDiscoveryService((address, port))
-    await asyncio.sleep(2)
-    await rsd.connect()
-    dvt = DvtSecureSocketProxyService(rsd)
-    dvt.perform_handshake()
 
-    while True:
-        vRand = 1000/(1000/v-(2*random.random()-1)*d)
-        run1(dvt, loc, vRand)
-        print("跑完一圈了")
+    async with RemoteServiceDiscoveryService((address, port)) as rsd:
+        async with open_dvt(rsd) as dvt:
+            async with open_location_simulation(dvt) as location_simulation:
+                try:
+                    while True:
+                        vRand = 1000 / (1000 / v - (2 * random.random() - 1) * d)
+                        await run1(location_simulation, loc, vRand)
+                        print("跑完一圈了")
+                finally:
+                    with suppress(Exception):
+                        await maybe_await(location_simulation.clear())
